@@ -1,11 +1,10 @@
-#!/usr/bin/env python3
-
 from __future__ import annotations
-
+from subprocess import PIPE, Popen
 import sys
-from subprocess import Popen, PIPE
-from typing import Any, Literal, TypedDict, overload
-import argparse
+from typing import Literal, TypedDict, overload
+
+from .pprint import verbosity, pprint, A
+
 
 class NonzeroResponse(Exception):
     """
@@ -34,40 +33,6 @@ class Commit(TypedDict):
     refs: list[Ref]
     title: str
 
-class A:
-    """
-    Ansi helpers
-    """
-    red = "\033[31m"
-    green = "\033[32m"
-    yellow = "\033[33m"
-    blue = "\033[34m"
-    magenta = "\033[35m"
-    gray = "\033[37m"
-
-    clear = "\033[0m"
-
-verbosity = 1
-"""
-The active verbosity of the command
-"""
-
-def pprint(*args: Any, **kwargs: Any) -> None:
-    """
-    A pretty print helper functions. Takes an additional keyword "color"
-    """
-    if verbosity >= 1:
-        needs_clear = False
-
-        if "color" in kwargs:
-            sys.stdout.write(kwargs["color"])
-            needs_clear = True
-            del kwargs["color"]
-
-        print(*args, **kwargs)
-
-        if needs_clear:
-            sys.stdout.write(A.clear)
 
 @overload
 def exc(cmd: str, *args: str, dry: Literal[False] = False) -> str: ...
@@ -80,7 +45,7 @@ def exc(cmd: str, *args: str, dry: bool = False) -> str | None:
     command_str = f"git {cmd} {' '.join(args)}"
     side_len = max(3, (100 - 2 - len(command_str)) // 2)
 
-    if dry or verbosity >= 2:
+    if dry or verbosity["value"] >= 2:
         color = A.gray if dry else A.yellow
         pprint(f"\n{'-' * side_len} {command_str} {'-' * side_len}", color = color)
 
@@ -96,7 +61,7 @@ def exc(cmd: str, *args: str, dry: bool = False) -> str | None:
     stdout_str = proc.stdout.read().decode("utf-8")
     stderr_str = proc.stderr.read().decode("utf-8")
 
-    if verbosity >= 3:
+    if verbosity["value"] >= 3:
         pprint(f"-> result: {A.blue}{result}{A.clear}")
 
         if stdout_str != "":
@@ -109,7 +74,7 @@ def exc(cmd: str, *args: str, dry: bool = False) -> str | None:
 
         pprint("-" * (side_len * 2 + 2 + len(command_str)), color = A.yellow)
 
-    if verbosity >= 2:
+    if verbosity["value"] >= 2:
         pprint("")
 
     if result != 0:
@@ -262,7 +227,22 @@ def apply_rebase(
     if len(rebase_chain) == 0:
         return
 
-    exc("rebase", "--onto", target_commit["hash"], rebase_ancestor["hash"], rebase_chain[0]["hash"])
+    try:
+        exc("rebase", "--onto", target_commit["hash"], rebase_ancestor["hash"], rebase_chain[0]["hash"])
+    except NonzeroResponse as NZR:
+        if NZR.code == 1:
+            pprint("Unable to complete rebase! Please manually complete the rebase.", color = A.yellow)
+            pprint(exc("status"), color = A.red)
+            pprint(f"When you're done, run {A.green}git rebase --continue{A.clear}, then type {A.green}[c/continue]{A.clear} to continue.")
+            pprint(f"You can safely {A.yellow}background{A.clear} this process")
+
+            while True:
+                sys.stdout.write(f"[{A.green}c/continue{A.clear}] > ")
+                if input().strip().lower() in ["c", "continue"]:
+                    break
+
+                pprint(f"Please type {A.green}[c/continue]{A.clear} to continue")
+
 
     return get_log("@", "@~1")[0]
 
@@ -329,94 +309,3 @@ def relabel(
 
                 update_local(ref, new, dry)
 
-
-def parse_args():
-    """
-    CLI Args
-    """
-    parser = argparse.ArgumentParser(description = "A tool to help you rebase a chain of branches in sequence")
-    parser.add_argument(
-        "target",
-        type = str,
-        help = "The target commit to rebase onto"
-    )
-    parser.add_argument(
-        "-@",
-        "--head",
-        type = str,
-        default = "@",
-        help = "The top commit to rebase from"
-    )
-    parser.add_argument(
-        "-d",
-        "--dry",
-        action = "store_true",
-        default = False,
-        help = "Don't change any refs, local or remote"
-    )
-    parser.add_argument(
-        "-p",
-        "--push",
-        type = str,
-        default = None,
-        help = "Update <origin> refs on the remote"
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action = "count",
-        default = 1,
-        help = "Print more"
-    )
-    parser.add_argument(
-        "-q",
-        "--quiet",
-        action = "store_true",
-        default = False,
-        help = "Print less",
-    )
-    parser.add_argument(
-        "-f",
-        "--force",
-        action = "store_true",
-        default = False,
-        help = "Use with [--push <origin>] to update all local refs on the remote, even those that don't exist in the current chain."
-    )
-
-    return parser.parse_args()
-
-def main():
-    global verbosity
-
-    args = parse_args()
-
-    if args.verbose > 1 and args.quiet:
-        pprint("Cannot be both quiet and verbose")
-        sys.exit(1)
-
-    verbosity = 0 if args.quiet else args.verbose
-
-    current_head = get_current_head()
-
-    try:
-        rebase_chain, rebase_ancestor, target_commit = get_target(args.head, args.target)
-        new_commit = apply_rebase(rebase_chain, rebase_ancestor, target_commit)
-        if new_commit is None:
-            return
-
-        relabel(
-            rebase_chain,
-            target_commit,
-            new_commit,
-            push = args.push,
-            dry = args.dry,
-            force = args.force,
-        )
-    except NonzeroResponse as e:
-        sys.stderr.write(f"Error executing command: {e.command} ({e.code})\n")
-        sys.stderr.write(e.stderr)
-
-    exc("checkout", current_head)
-
-if __name__ == "__main__":
-    main()
