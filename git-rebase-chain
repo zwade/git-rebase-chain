@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import sys
+from subprocess import Popen, PIPE
+from typing import Any, Literal, TypedDict, overload
+import argparse
+
+class NonzeroResponse(Exception):
+    """
+    An error to be thrown when a command returns a non-zero exit code.
+    """
+    def __init__(self, code: int, stdout: str, stderr: str, command: str):
+        super().__init__(stderr)
+        self.code = code
+        self.stdout = stdout
+        self.stderr = stderr
+        self.command = command
+
+class Ref(TypedDict):
+    """
+    A git ref
+    """
+    name: str
+    path: str
+    remote: str | None
+
+class Commit(TypedDict):
+    """
+    A git commit
+    """
+    hash: str
+    refs: list[Ref]
+    title: str
+
+class A:
+    """
+    Ansi helpers
+    """
+    red = "\033[31m"
+    green = "\033[32m"
+    yellow = "\033[33m"
+    blue = "\033[34m"
+    magenta = "\033[35m"
+    gray = "\033[37m"
+
+    clear = "\033[0m"
+
+verbosity = 1
+"""
+The active verbosity of the command
+"""
+
+def pprint(*args: Any, **kwargs: Any) -> None:
+    """
+    A pretty print helper functions. Takes an additional keyword "color"
+    """
+    if verbosity >= 1:
+        needs_clear = False
+
+        if "color" in kwargs:
+            sys.stdout.write(kwargs["color"])
+            needs_clear = True
+            del kwargs["color"]
+
+        print(*args, **kwargs)
+
+        if needs_clear:
+            sys.stdout.write(A.clear)
+
+@overload
+def exc(cmd: str, *args: str, dry: Literal[False] = False) -> str: ...
+@overload
+def exc(cmd: str, *args: str, dry: bool) -> str | None: ...
+def exc(cmd: str, *args: str, dry: bool = False) -> str | None:
+    """
+    Executes a git command and returns the result
+    """
+    command_str = f"git {cmd} {' '.join(args)}"
+    side_len = max(3, (100 - 2 - len(command_str)) // 2)
+
+    if dry or verbosity >= 2:
+        color = A.gray if dry else A.yellow
+        pprint(f"\n{'-' * side_len} {command_str} {'-' * side_len}", color = color)
+
+    if dry:
+        pprint("")
+        return None
+
+    proc = Popen(["git", cmd, *args], stdout = PIPE, stderr = PIPE)
+    result = proc.wait()
+
+    assert proc.stdout and proc.stderr
+
+    stdout_str = proc.stdout.read().decode("utf-8")
+    stderr_str = proc.stderr.read().decode("utf-8")
+
+    if verbosity >= 3:
+        pprint(f"-> result: {A.blue}{result}{A.clear}")
+
+        if stdout_str != "":
+            pprint("-> stdout:")
+            pprint(stdout_str, color = A.blue)
+
+        if stderr_str != "":
+            pprint("-> stderr:")
+            pprint(stderr_str, color = A.red)
+
+        pprint("-" * (side_len * 2 + 2 + len(command_str)), color = A.yellow)
+
+    if verbosity >= 2:
+        pprint("")
+
+    if result != 0:
+        raise NonzeroResponse(result, stdout_str, stderr_str, command_str)
+
+    return stdout_str.strip()
+
+def parse_ref(ref: str, remotes: list[str]) -> Ref | None:
+    """
+    Parses a git ref from a variety of sources, and returns a Ref object
+    """
+    ref = ref.strip()
+    if "->" in ref:
+        ref = ref.split("->")[1].strip()
+
+    if ref.startswith("refs/heads/"):
+        ref = ref[11:]
+    else:
+        for remote in remotes:
+            if ref.startswith(f"{remote}/"):
+                return {
+                    "name": ref[len(remote) + 1:],
+                    "path": ref,
+                    "remote": remote,
+                }
+
+    name = ref
+    path = f"refs/heads/{ref}"
+
+    if name == "HEAD":
+        return None
+
+    return {
+        "name": name,
+        "path": path,
+        "remote": None,
+    }
+
+def get_current_head():
+    """
+    Finds and returns the current HEAD value
+    """
+    git_dir = exc("rev-parse", "--absolute-git-dir")
+    with open(f"{git_dir}/HEAD", "r") as head_file:
+        head = head_file.read()
+
+    if head.startswith("ref: "):
+        head = head[5:]
+        ref = parse_ref(head, [])
+
+        if ref:
+            return ref["name"]
+
+    return head
+
+
+def parse_log_line(line: str, remotes: list[str]) -> Commit:
+    """
+    Parses a single line from the git log as formatted by
+    `--format=format:%H|%d|%f`
+    """
+    hash, refs, title = line.strip().split("|")
+    commit = Commit(hash = hash, refs = [], title = title)
+
+    if refs != "":
+        refs = refs.strip()
+        if refs[0] != "(" or refs[-1] != ")":
+            return commit
+
+        individual_refs = [
+            parse_ref(ref, remotes)
+            for ref in refs[1:-1].split(", ")
+        ]
+
+        commit["refs"] = [
+            ref
+            for ref in individual_refs
+            if ref is not None
+        ]
+
+    return commit
+
+def get_log(head: str, base: str):
+    """
+    Gets the git log from base..head, and parses it
+    """
+    log = exc("log", f"{base}..{head}", "--format=format:%H|%d|%f")
+    remotes = exc("remote", "show").split("\n")
+
+    lines = [
+        parse_log_line(line, remotes)
+        for line in log.split("\n")
+        if line.strip() != ""
+    ]
+
+    return lines
+
+def get_target(head_name: str, target_name: str):
+    """
+    Computes the merge base of the head and the target,
+    then attempts to identify the old version of the target
+    in the original chain. Returns each of these three things as
+    a tuple
+    `(rebase_chain, rebase_ancestor, target_commit)`
+    """
+
+    head = exc("rev-parse", "--verify", head_name)
+    target = exc("rev-parse", "--verify", target_name)
+    merge_base = exc("merge-base", head, target)
+
+    if merge_base == target:
+        pprint("Head is already based on target. Nothing to be done!", color = A.blue)
+        sys.exit(0)
+
+    primary_chain = get_log(head, merge_base)
+
+    try:
+        target_commit = get_log(target, f"{target}~1")[0]
+    except IndexError:
+        pprint("Could not find the target commit in the log. Are you sure it's correct?", color = A.red)
+        sys.exit(1)
+
+    rebase_chain: list[Commit] = []
+    rebase_ancestor: Commit | None = None
+    for elt in primary_chain:
+        if elt["title"] == target_commit["title"]:
+            rebase_ancestor = elt
+            break
+
+        rebase_chain.append(elt)
+
+    if rebase_ancestor is None:
+        pprint(f"Unable to identify the predecessor of {target_name} in the current chain. Please specify it explicitly and try again", color = A.red)
+        sys.exit(1)
+
+    return (
+        rebase_chain,
+        rebase_ancestor,
+        target_commit,
+    )
+
+def apply_rebase(
+    rebase_chain: list[Commit],
+    rebase_ancestor: Commit,
+    target_commit: Commit,
+):
+    """
+    Performs the rebase step
+    """
+    if len(rebase_chain) == 0:
+        return
+
+    exc("rebase", "--onto", target_commit["hash"], rebase_ancestor["hash"], rebase_chain[0]["hash"])
+
+    return get_log("@", "@~1")[0]
+
+def update_remote(
+    remote: str,
+    ref: Ref,
+    target_commit: Commit,
+    dry: bool = True
+):
+    """
+    Updates a ref on the remote
+    """
+    pprint(f"Updating remote {A.red}{ref['name']}{A.clear} to {A.yellow}{target_commit['hash']}{A.clear}")
+    exc(
+        "push", "-f", remote, f"{target_commit['hash']}:{ref['name']}",
+        dry = dry
+    )
+
+def update_local(
+    ref: Ref,
+    target_commit: Commit,
+    dry: bool = True
+):
+    """
+    Updates a ref locally
+    """
+    pprint(f"Updating {A.green}{ref['name']}{A.clear} to {A.yellow}{target_commit['hash']}{A.clear}")
+    exc(
+        "update-ref", ref["path"], target_commit["hash"],
+        dry = dry
+    )
+
+def relabel(
+    original_rebase_chain: list[Commit],
+    target_commit: Commit,
+    new_commit: Commit,
+    push: str | None = None,
+    dry: bool = True,
+    force: bool = False,
+):
+    """
+    Relabels all refs in the newly rebased chain, optionally pushing to origin
+    if [push] is specified
+    """
+    new_rebase_chain = get_log(new_commit["hash"], target_commit["hash"])
+
+    if len(new_rebase_chain) != len(original_rebase_chain):
+        pprint("Something went wrong during rebase. Returning to the original state")
+        exc("checkout", original_rebase_chain[0]["hash"])
+        sys.exit(1)
+
+    for original, new in zip(original_rebase_chain, new_rebase_chain):
+        pushed_to_remote = False
+
+        for ref in original["refs"]:
+            if push is not None and push == ref["remote"]:
+                update_remote(push, ref, new, dry)
+                pushed_to_remote = True
+
+        for ref in original["refs"]:
+            if ref["remote"] is None:
+                if push is not None and force and not pushed_to_remote:
+                    update_remote(push, ref, new, dry)
+
+                update_local(ref, new, dry)
+
+
+def parse_args():
+    """
+    CLI Args
+    """
+    parser = argparse.ArgumentParser(description = "A tool to help you rebase a chain of branches in sequence")
+    parser.add_argument(
+        "target",
+        type = str,
+        help = "The target commit to rebase onto"
+    )
+    parser.add_argument(
+        "-@",
+        "--head",
+        type = str,
+        default = "@",
+        help = "The top commit to rebase from"
+    )
+    parser.add_argument(
+        "-d",
+        "--dry",
+        action = "store_true",
+        default = False,
+        help = "Don't change any refs, local or remote"
+    )
+    parser.add_argument(
+        "-p",
+        "--push",
+        type = str,
+        default = None,
+        help = "Update <origin> refs on the remote"
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action = "count",
+        default = 1,
+        help = "Print more"
+    )
+    parser.add_argument(
+        "-q",
+        "--quiet",
+        action = "store_true",
+        default = False,
+        help = "Print less",
+    )
+    parser.add_argument(
+        "-f",
+        "--force",
+        action = "store_true",
+        default = False,
+        help = "Use with [--push <origin>] to update all local refs on the remote, even those that don't exist in the current chain."
+    )
+
+    return parser.parse_args()
+
+def main():
+    global verbosity
+
+    args = parse_args()
+
+    if args.verbose > 1 and args.quiet:
+        pprint("Cannot be both quiet and verbose")
+        sys.exit(1)
+
+    verbosity = 0 if args.quiet else args.verbose
+
+    current_head = get_current_head()
+
+    try:
+        rebase_chain, rebase_ancestor, target_commit = get_target(args.head, args.target)
+        new_commit = apply_rebase(rebase_chain, rebase_ancestor, target_commit)
+        if new_commit is None:
+            return
+
+        relabel(
+            rebase_chain,
+            target_commit,
+            new_commit,
+            push = args.push,
+            dry = args.dry,
+            force = args.force,
+        )
+    except NonzeroResponse as e:
+        sys.stderr.write(f"Error executing command: {e.command} ({e.code})\n")
+        sys.stderr.write(e.stderr)
+
+    exc("checkout", current_head)
+
+if __name__ == "__main__":
+    main()
