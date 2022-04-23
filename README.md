@@ -22,3 +22,23 @@ Updating c to f6b59999b9dff86df0b6e7e0d9096946bd47c77a
 ```
 
 Now all of our refs, both local and remote are up to date!
+
+## Installation & Usage
+
+To install
+
+```bash
+python3 -m pip install git-rebase-chain
+```
+
+To use
+
+```bash
+git rebase-chain [-@ <head>] [--dry] [--push <remote>] [-vvv] [--quiet] [--force] <target>
+```
+
+## Credits
+
+Maintained by Zach Wade <zwad3>
+
+Contributions always welcome!
