@@ -75,7 +75,7 @@ def main():
     current_head = get_current_head()
 
     try:
-        rebase_chain, rebase_ancestor, target_commit = get_target(args.head, args.target)
+        rebase_chain, rebase_ancestor, target_commit = get_target(args.head, args.target, force = args.force)
         new_commit = apply_rebase(rebase_chain, rebase_ancestor, target_commit)
         if new_commit is None:
             return

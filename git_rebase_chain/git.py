@@ -172,7 +172,7 @@ def get_log(head: str, base: str):
 
     return lines
 
-def get_target(head_name: str, target_name: str):
+def get_target(head_name: str, target_name: str, force: bool = False):
     """
     Computes the merge base of the head and the target,
     then attempts to identify the old version of the target
@@ -185,7 +185,7 @@ def get_target(head_name: str, target_name: str):
     target = exc("rev-parse", "--verify", target_name)
     merge_base = exc("merge-base", head, target)
 
-    if merge_base == target:
+    if merge_base == target and not force:
         pprint("Head is already based on target. Nothing to be done!", color = A.blue)
         sys.exit(0)
 
@@ -257,7 +257,7 @@ def update_remote(
     """
     pprint(f"Updating remote {A.red}{ref['name']}{A.clear} to {A.yellow}{target_commit['hash']}{A.clear}")
     exc(
-        "push", "-f", remote, f"{target_commit['hash']}:{ref['name']}",
+        "push", "-f", remote, f"{target_commit['hash']}:refs/heads/{ref['name']}",
         dry = dry
     )
 
